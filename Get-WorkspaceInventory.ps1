@@ -6,6 +6,9 @@
     per item.
 
 .DESCRIPTION
+    Full guide, with a sample of the output: README.md next to this script
+    (power-bi-api/workspace-inventory/ in the work-notes repository).
+
     Give it one or more workspace GUIDs (-WorkspaceId) or a file of them
     (-WorkspaceIdFile). Run it signed in with either:
     - an account with a role in the workspace (Admin, Member or Contributor
@@ -26,10 +29,30 @@
 
         WorkspaceName, WorkspaceId     the workspace
         ItemName, ItemType, ItemId     semantic model, interactive report,
-                                       paginated report or dashboard
+                                       paginated report, dashboard, App (one row
+                                       for a workspace's published app), or
+                                       Gateway (one row per gateway the items use:
+                                       type, version, members, settings in
+                                       QueryDetail; its roles in ItemAccess)
         Folder                         workspace folder path, e.g. Finance/Monthly
+        Owner, Created, ModifiedBy,    who owns the item (model: configured by;
+        Modified                       report: created by; app: published by) and
+                                       when it was created and last changed
+        Endorsement                    Promoted or Certified (and by whom)
+        SensitivityLabel               the sensitivity label's ID (names are in
+                                       Microsoft Purview)
+        Description                    the item's description
+                                       With a standard account these come only
+                                       for semantic models (reports: description
+                                       only; dashboards: none)
+        InApp                          reports and dashboards: the name of the
+                                       workspace app they're published in, or
+                                       No. Fabric admin account only
         WorkspacePermissions           who has which workspace role
-        ItemAccess                     who has access to this item other than
+        ItemAccess                     App rows: everyone the app is shared with
+                                       and their permissions (the audience each
+                                       person is in isn't available from the API).
+                                       Other rows: who has access to the item other than
                                        through a workspace role (shared directly,
                                        or a Viewer given more than Read), and with
                                        which permissions. All item types with a
@@ -37,7 +60,21 @@
                                        with a standard account (needs Admin or
                                        Member on the workspace)
         RefreshSchedule                days, times, time zone
-        DataSources                    servers, databases, URLs, gateways, dataflows
+        Subscriptions                  reports and dashboards: each email
+                                       subscription with its frequency, state,
+                                       format, dates and recipients. Fabric admin
+                                       account only (admin API, preview, limited
+                                       to 200 calls an hour; items past the limit
+                                       say so). Blank for semantic models
+        Security                       semantic models: each row-level security
+                                       role with its filters, any object-level
+                                       security (hidden tables and columns), and
+                                       its members
+        DataSources                    servers, databases, URLs, dataflows, and for
+                                       each source its gateway and connection
+                                       (name, authentication, privacy level). On a
+                                       Gateway row: each connection with its users
+                                       and the items that use it
                                        (blank for an interactive report that uses a
                                        semantic model: see the model's own row)
         TableCount, QueryCount,        counts (see below) and their breakdown
@@ -46,6 +83,12 @@
                                        paginated report dataset) with its kind
                                        and connectors
         Queries                        the full M, DAX or SQL of each of them
+
+    Signed in as a Fabric administrator, it also saves a tenant settings
+    snapshot, PowerBI-tenant-settings-<date>-<time>.csv: every Admin portal
+    tenant setting (enabled or not, which security groups it applies to or
+    excludes, who it's delegated to, its extra options) and every capacity,
+    domain and workspace override, one row each.
 
     A workspace that can't be read gets one "Workspace error" row with the
     reason, and the script carries on with the next workspace. Cells longer
@@ -115,6 +158,10 @@
     Use this when signed in with an account that isn't a Fabric administrator.
     (Without it, the script tries the scan and switches over on its own.)
 
+.PARAMETER SkipTenantSettings
+    Don't save the tenant settings snapshot. (It's only saved when signed in
+    as a Fabric administrator, and never with -NoAdminScan.)
+
 .PARAMETER PassThru
     Also return the rows as objects, for example to pipe into Out-GridView.
 
@@ -148,11 +195,12 @@ param(
     [switch] $SkipRdlDownload,
     [switch] $SkipModelDefinition,
     [switch] $NoAdminScan,
+    [switch] $SkipTenantSettings,
     [switch] $PassThru
 )
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "2026-11-23.2"
+$ScriptVersion = "2026-11-23.9"
 
 # On any error, show where it happened, so the problem can be found from the output alone.
 trap {
@@ -170,7 +218,7 @@ Write-Host "Get-WorkspaceInventory version $ScriptVersion (PowerShell $($PSVersi
 # ---------------------------------------------------------------------------
 
 if (-not (Get-Command Invoke-PowerBIRestMethod -ErrorAction SilentlyContinue)) {
-    throw "The MicrosoftPowerBIMgmt module isn't installed. See power-bi-api-powershell-vscode.md."
+    throw "The MicrosoftPowerBIMgmt module isn't installed. See power-bi-api/power-bi-api-powershell-vscode.md in the work-notes repository."
 }
 try { $null = Get-PowerBIAccessToken } catch {
     throw "You aren't signed in. Run Connect-PowerBIServiceAccount and try again."
@@ -206,12 +254,103 @@ function Join-NonEmpty([string] $Separator, $Values) {
     (@($Values) | Where-Object { $_ -and "$_".Trim() } | Select-Object -Unique) -join $Separator
 }
 
-function Format-DataSource($S) {
+# ---- Fabric API (folders, model definitions, gateways, connections) ----
+
+# GET with paging. On "too many requests" (429) it waits and tries again.
+function Get-FabricPaged([string] $Url, [string] $ListProperty = "value") {
+    $next = $Url
+    while ($next) {
+        $page = $null
+        for ($try = 1; -not $page; $try++) {
+            try {
+                $headers = @{ Authorization = (Get-PowerBIAccessToken -AsString) }
+                $page = Invoke-RestMethod -Uri $next -Method Get -Headers $headers -ErrorAction Stop
+            } catch {
+                if ($try -lt 4 -and "$($_.Exception.Message)" -match '429|Too ?Many') {
+                    Write-Host "  Fabric API busy (429); waiting 60 seconds ..." -ForegroundColor Yellow
+                    Start-Sleep -Seconds 60
+                } else { throw }
+            }
+        }
+        $list = Get-Prop $page $ListProperty
+        if ($null -eq $list -and $ListProperty -eq "value") { $list = Get-Prop $page "Overrides" }
+        foreach ($v in @($list)) { if ($v) { $v } }
+        $next = Get-Prop $page "continuationUri"
+    }
+}
+
+# ---- Gateways and connections ----
+# Read once per run. Each account only sees the gateways and connections it
+# has a role on (gateway Admin or Connection creator, connection User or
+# Owner); the rest are shown by ID.
+
+$script:gatewayById    = $null
+$script:connectionById = $null
+$script:gatewayUse     = @{}   # gateway ID -> connection ID -> list of "workspace / item"
+$script:gatewaySource  = @{}   # connection ID -> its data source as text
+function Initialize-Gateways {
+    if ($null -ne $script:gatewayById) { return }
+    $script:gatewayById = @{}; $script:connectionById = @{}
+    try { foreach ($g in Get-FabricPaged "$FabricApiUrl/gateways") { $script:gatewayById["$($g.id)".ToLowerInvariant()] = $g } }
+    catch { Write-Warning "Gateways couldn't be listed: $(Get-ShortError $_). Gateways are shown by ID only." }
+    try { foreach ($c in Get-FabricPaged "$FabricApiUrl/connections") { $script:connectionById["$($c.id)".ToLowerInvariant()] = $c } }
+    catch { Write-Warning "Connections couldn't be listed: $(Get-ShortError $_). Connections are shown by ID only." }
+    Write-Host "Gateways visible to this account: $($script:gatewayById.Count); connections: $($script:connectionById.Count)"
+}
+
+function Get-GatewayLabel([string] $GatewayId) {
+    $g = $script:gatewayById["$GatewayId".ToLowerInvariant()]
+    if (-not $g) { return "gateway $GatewayId (no access to its details)" }
+    $name = $(if (Get-Prop $g "displayName") { $g.displayName } else { "personal gateway $GatewayId" })
+    "gateway: $name ($(Get-Prop $g 'type'))"
+}
+
+function Get-ConnectionLabel([string] $ConnectionId) {
+    $c = $script:connectionById["$ConnectionId".ToLowerInvariant()]
+    if (-not $c) { return $(if ($ConnectionId) { "connection $ConnectionId (no access to its details)" }) }
+    $cred = Get-Prop $c "credentialDetails"
+    $sso  = Get-Prop $cred "singleSignOnType"
+    $info = Join-NonEmpty ", " @((Get-Prop $cred "credentialType"), $(if ($sso -and $sso -ne "None") { "SSO $sso" }),
+                                 $(if (Get-Prop $c "privacyLevel") { "privacy $($c.privacyLevel)" }))
+    "connection: $($c.displayName)$(if ($info) { " ($info)" })"
+}
+
+# One data source as text. $UsedBy ("workspace / item") records which items
+# use each gateway connection, for the Gateway rows.
+function Format-DataSource($S, [string] $UsedBy) {
     $c = Get-Prop $S "connectionDetails"
     $where = Join-NonEmpty " / " @((Get-Prop $c "server"), (Get-Prop $c "database"), (Get-Prop $c "url"),
                                    (Get-Prop $c "path"), (Get-Prop $c "account"), (Get-Prop $c "kind"))
-    $gw = $(if (Get-Prop $S "gatewayId") { " [gateway]" } else { "" })
+    $gatewayId    = "$(Get-Prop $S 'gatewayId')"
+    # Workspace-API sources carry the real ID in connectionId (their datasourceId is the script's own key)
+    $connectionId = "$(if ($S.PSObject.Properties['connectionId']) { $S.connectionId } else { Get-Prop $S 'datasourceId' })"
+    $gw = ""
+    if ($gatewayId) {
+        Initialize-Gateways
+        $conn = $script:connectionById[$connectionId.ToLowerInvariant()]
+        if ($conn -and "$(Get-Prop $conn 'connectivityType')" -match 'Cloud') {
+            $gw = " [cloud $(Get-ConnectionLabel $connectionId)]"
+        } else {
+            $gw = " [$(Join-NonEmpty '; ' @((Get-GatewayLabel $gatewayId), (Get-ConnectionLabel $connectionId)))]"
+            $gKey = $gatewayId.ToLowerInvariant()
+            if (-not $script:gatewayUse.ContainsKey($gKey)) { $script:gatewayUse[$gKey] = @{} }
+            $cKey = $(if ($connectionId) { $connectionId.ToLowerInvariant() } else { "(unknown)" })
+            if (-not $script:gatewayUse[$gKey].ContainsKey($cKey)) { $script:gatewayUse[$gKey][$cKey] = New-Object System.Collections.Generic.List[string] }
+            if ($UsedBy -and -not $script:gatewayUse[$gKey][$cKey].Contains($UsedBy)) { $script:gatewayUse[$gKey][$cKey].Add($UsedBy) }
+            if (-not $script:gatewaySource.ContainsKey($cKey)) { $script:gatewaySource[$cKey] = $(if ($where) { "$($S.datasourceType): $where" } else { "$($S.datasourceType)" }) }
+        }
+    }
     if ($where) { "$($S.datasourceType): $where$gw" } else { "$($S.datasourceType)$gw" }
+}
+
+# A principal from a Fabric role assignment, as text.
+function Format-FabricPrincipal($P) {
+    $type = Get-Prop $P "type"
+    if ($type -eq "EntireTenant") { return "Entire organization" }
+    $name = $(if (Get-Prop $P "displayName") { $P.displayName } else { Get-Prop $P "id" })
+    $upn  = Get-Prop (Get-Prop $P "userDetails") "userPrincipalName"
+    $text = $(if ($upn -and $upn -ne $name) { "$name ($upn)" } else { "$name" })
+    switch ($type) { "Group" { "$text (group)" } "ServicePrincipal" { "$text (app)" } default { $text } }
 }
 
 # The connector functions an M expression calls, e.g. "Sql.Database, Web.Contents".
@@ -264,6 +403,60 @@ function Format-ItemAccess($Users, [string] $RightProperty) {
 
 $noAdminAccess = "Not available without a Fabric admin account"
 
+# ---- Item details: owner, dates, endorsement, sensitivity label, description ----
+# The admin scan has them for every item type; the workspace APIs have them for
+# semantic models, the description for reports, and none for dashboards.
+
+# Times are shown in UTC. Power BI returns them in UTC, but PowerShell 7 may
+# turn a time ending in "Z" into local time; that is turned back here.
+function Format-When($Value) {
+    if (-not $Value) { return $null }
+    $when = $null
+    if ($Value -is [datetime]) { $when = $Value }
+    else {
+        $parsed = [datetime]::MinValue
+        if ([datetime]::TryParse("$Value", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref] $parsed)) { $when = $parsed }
+        else { return "$Value" }
+    }
+    if ($when.Kind -eq [DateTimeKind]::Local) { $when = $when.ToUniversalTime() }
+    $when.ToString("yyyy-MM-dd HH:mm") + " UTC"
+}
+
+function Get-ItemMeta($Item) {
+    $e = Get-Prop $Item "endorsementDetails"
+    $endorsement = Get-Prop $e "endorsement"
+    if ($endorsement -eq "None") { $endorsement = $null }
+    if ($endorsement -and (Get-Prop $e "certifiedBy")) { $endorsement = "$endorsement by $($e.certifiedBy)" }
+    [pscustomobject]@{
+        Owner            = @((Get-Prop $Item "configuredBy"), (Get-Prop $Item "createdBy"), (Get-Prop $Item "publishedBy")) | Where-Object { $_ } | Select-Object -First 1
+        Created          = Format-When (@((Get-Prop $Item "createdDate"), (Get-Prop $Item "createdDateTime")) | Where-Object { $_ } | Select-Object -First 1)
+        ModifiedBy       = Get-Prop $Item "modifiedBy"
+        Modified         = Format-When (@((Get-Prop $Item "modifiedDateTime"), (Get-Prop $Item "lastUpdate")) | Where-Object { $_ } | Select-Object -First 1)
+        Endorsement      = $endorsement
+        SensitivityLabel = Get-Prop (Get-Prop $Item "sensitivityLabel") "labelId"
+        Description      = Get-Prop $Item "description"
+    }
+}
+
+# Email subscriptions of a report or dashboard (admin API, preview, 200 calls an hour).
+$script:subscriptionLimitHit = $false
+function Format-Subscriptions($List) {
+    $subs = foreach ($x in @($List) | Where-Object { $_ }) {
+        $state = $(if ((Get-Prop $x "isEnabled") -eq $false) { "disabled" } else { "enabled" })
+        $start = "$(Get-Prop $x 'startDate')".Split(' ')[0]
+        $end   = "$(Get-Prop $x 'endDate')".Split(' ')[0]
+        $when  = Join-NonEmpty " to " @($start, $end)
+        $page  = Get-Prop $x "subArtifactDisplayName"
+        $to    = Join-NonEmpty ", " (@(Get-Prop $x "users") | Where-Object { $_ } | ForEach-Object {
+            if (Get-Prop $_ "emailAddress") { $_.emailAddress } else { Format-Principal $_ }
+        })
+        $details = Join-NonEmpty ", " @((Get-Prop $x "frequency"), $state, (Get-Prop $x "attachmentFormat"), $(if ($page) { "page '$page'" }), $when)
+        "$(Get-Prop $x 'title') ($details)$(if ($to) { "; to: $to" })"
+    }
+    $text = Join-NonEmpty " | " @($subs)
+    $(if ($text) { $text } else { "None" })
+}
+
 # ---------------------------------------------------------------------------
 # Workspaces to read
 # ---------------------------------------------------------------------------
@@ -288,6 +481,7 @@ $rows      = New-Object System.Collections.Generic.List[object]   # one per item
 $tableRows = New-Object System.Collections.Generic.List[object]   # tables/queries, joined into the item rows at the end
 $failed    = New-Object System.Collections.Generic.List[object]
 $script:adminScanRefused = $false
+$script:appsByWorkspace = $null   # tenant app list, read once on the first admin-scanned workspace
 $n = 0
 
 foreach ($wsId in $workspaceIds) {
@@ -337,7 +531,7 @@ foreach ($wsId in $workspaceIds) {
                     foreach ($x in @($src.value) | Where-Object { $_ }) {
                         $id = [guid]::NewGuid().ToString()
                         $instances.Add([pscustomobject]@{
-                            datasourceId = $id; datasourceType = Get-Prop $x "datasourceType"
+                            datasourceId = $id; connectionId = Get-Prop $x "datasourceId"; datasourceType = Get-Prop $x "datasourceType"
                             connectionDetails = Get-Prop $x "connectionDetails"; gatewayId = Get-Prop $x "gatewayId"
                         })
                         $usages += [pscustomobject]@{ datasourceInstanceId = $id }
@@ -351,6 +545,8 @@ foreach ($wsId in $workspaceIds) {
                 }
                 [pscustomobject]@{
                     id = $d.id; name = $d.name; ContentProviderType = Get-Prop $d "ContentProviderType"
+                    configuredBy = Get-Prop $d "configuredBy"; createdDate = Get-Prop $d "createdDate"; description = Get-Prop $d "description"
+                    endorsementDetails = Get-Prop $d "endorsementDetails"; sensitivityLabel = Get-Prop $d "sensitivityLabel"
                     datasourceUsages = $usages; upstreamDataflows = $up
                 }
             }
@@ -403,6 +599,45 @@ foreach ($wsId in $workspaceIds) {
         $datasets   = @(Get-Prop $wsInfo "datasets")   | Where-Object { $_ }
         $reports    = @(Get-Prop $wsInfo "reports")    | Where-Object { $_ -and -not (Get-Prop $_ "appId") }   # skip app copies
         $dashboards = @(Get-Prop $wsInfo "dashboards") | Where-Object { $_ -and -not (Get-Prop $_ "appId") }
+
+        # Workspace app (admin only). The scan lists each report and dashboard in
+        # the app as an extra "[App] ..." copy with an appId; those copies tell
+        # which originals are in the app. App names and publishers come from the
+        # tenant's app list (read once per run), audiences from the app's users.
+        $wsApps = @()
+        [hashtable] $inAppById = @{}
+        if ($isFabricAdmin) {
+            if ($null -eq $script:appsByWorkspace) {
+                $script:appsByWorkspace = @{}
+                $skip = 0
+                do {
+                    $page = Try-PbiGet "admin/apps?`$top=5000$(if ($skip) { "&`$skip=$skip" })"
+                    if (-not $page) { Write-Warning "Workspace apps couldn't be read: $script:LastError"; break }
+                    foreach ($a in @($page.value) | Where-Object { $_ }) {
+                        $key = "$(Get-Prop $a 'workspaceId')".ToLowerInvariant()
+                        if (-not $script:appsByWorkspace.ContainsKey($key)) { $script:appsByWorkspace[$key] = @() }
+                        $script:appsByWorkspace[$key] += $a
+                    }
+                    $skip += 5000
+                } while (@($page.value).Count -eq 5000)
+            }
+            $wsApps = @($script:appsByWorkspace["$wsId".ToLowerInvariant()]) | Where-Object { $_ }
+            $appName = @{}
+            foreach ($a in $wsApps) { $appName[$a.id] = $a.name }
+            $dashboardByName = @{}
+            foreach ($db in $dashboards) { $dashboardByName[$db.displayName] = $db.id }
+            $appCopies = @(@(Get-Prop $wsInfo "reports") + @(Get-Prop $wsInfo "dashboards") | Where-Object { $_ -and (Get-Prop $_ "appId") })
+            foreach ($c in $appCopies) {
+                $label = $(if ($appName.ContainsKey($c.appId)) { $appName[$c.appId] } else { "app $($c.appId)" })
+                $original = Get-Prop $c "originalReportId"
+                if (-not $original) {
+                    # Dashboards have no original ID in the scan: match on the name without "[App] "
+                    $plain = ("$(Get-Prop $c 'displayName')" -replace '^\[App\]\s*', '')
+                    if ($dashboardByName.ContainsKey($plain)) { $original = $dashboardByName[$plain] }
+                }
+                if ($original) { $inAppById[$original] = $label }
+            }
+        }
         [hashtable] $datasetById = @{}
         foreach ($d in $datasets) { $datasetById[$d.id] = $d }
 
@@ -433,6 +668,22 @@ foreach ($wsId in $workspaceIds) {
         [hashtable] $roleByKey = @{}
         foreach ($p in $permissionRows) { foreach ($k in $p.Keys) { $roleByKey[$k] = $p.Role } }
 
+        # Email subscriptions of a report or dashboard. Admin only.
+        function Get-Subscriptions($Item, [string] $Kind) {
+            if (-not $isFabricAdmin) { return $noAdminAccess }
+            if ($script:subscriptionLimitHit) { return "Not read: the admin API limit of 200 calls an hour was reached; run again later" }
+            $list = Try-PbiGet "admin/$($Kind)s/$($Item.id)/subscriptions"
+            if (-not $list) {
+                if ("$script:LastError" -match '429|Too ?Many') {
+                    $script:subscriptionLimitHit = $true
+                    Write-Host "  Subscriptions: admin API limit of 200 calls an hour reached; the rest are marked as not read." -ForegroundColor Yellow
+                    return "Not read: the admin API limit of 200 calls an hour was reached; run again later"
+                }
+                return "Could not read: $script:LastError"
+            }
+            Format-Subscriptions $list.value
+        }
+
         # Item access for one item. The admin scan includes each item's users;
         # without it only semantic models can be read (needs Admin or Member).
         function Get-ItemAccess($Item, [string] $Kind) {
@@ -451,24 +702,14 @@ foreach ($wsId in $workspaceIds) {
         # 3. Folders (Fabric API)
         # ---------------------------------------------------------------------------
 
-        function Get-FabricPaged([string] $Url, [hashtable] $Headers, [string] $ListProperty = "value") {
-            $next = $Url
-            while ($next) {
-                $page = Invoke-RestMethod -Uri $next -Method Get -Headers $Headers -ErrorAction Stop
-                foreach ($v in @(Get-Prop $page $ListProperty)) { if ($v) { $v } }
-                $next = Get-Prop $page "continuationUri"
-            }
-        }
-
         [hashtable] $folderOfItem = @{}
         $folderRows   = @()
         $folderSource = "Fabric API"
-        $headers = @{ Authorization = (Get-PowerBIAccessToken -AsString) }
 
         # Folder names: needs a role in the workspace (Viewer or higher).
         [hashtable] $byId = @{}
         try {
-            foreach ($f in Get-FabricPaged "$FabricApiUrl/workspaces/$wsId/folders" $headers) { $byId[$f.id] = $f }
+            foreach ($f in Get-FabricPaged "$FabricApiUrl/workspaces/$wsId/folders") { $byId[$f.id] = $f }
         } catch {
             $folderSource = "folder names unavailable ($(Get-ShortError $_)); add yourself to the workspace to see them"
             Write-Warning "Folder names couldn't be read: $(Get-ShortError $_). They need a role in the workspace; folder IDs are shown instead."
@@ -490,11 +731,11 @@ foreach ($wsId in $workspaceIds) {
 
         # Which folder each item is in: workspace call first, admin call if you have no role in the workspace.
         $items = $null
-        try { $items = @(Get-FabricPaged "$FabricApiUrl/workspaces/$wsId/items" $headers) }
+        try { $items = @(Get-FabricPaged "$FabricApiUrl/workspaces/$wsId/items") }
         catch {
             try {
                 if (-not $isFabricAdmin) { throw }
-                $items = @(Get-FabricPaged "$FabricApiUrl/admin/items?workspaceId=$wsId" $headers "itemEntities")
+                $items = @(Get-FabricPaged "$FabricApiUrl/admin/items?workspaceId=$wsId" "itemEntities")
             } catch {
                 $folderSource = "unavailable ($(Get-ShortError $_))"
                 Write-Warning "Item folders couldn't be read from the Fabric API: $(Get-ShortError $_)"
@@ -637,7 +878,10 @@ foreach ($wsId in $workspaceIds) {
             $exprs = foreach ($e in @(Get-Prop $D "expressions") | Where-Object { $_ }) {
                 [pscustomobject]@{ Name = $e.name; Query = Get-Prop $e "expression" }
             }
-            [pscustomobject]@{ Tables = @($tables); Expressions = @($exprs) }
+            [pscustomobject]@{
+                Tables = @($tables); Expressions = @($exprs)
+                Roles = @(ConvertFrom-RoleObjects (Get-Prop $D "roles")); RolesKnown = ($null -ne $D.PSObject.Properties["roles"])
+            }
         }
 
         # --- Read from the model definition (TMDL) ----------------------------------
@@ -774,7 +1018,75 @@ foreach ($wsId in $workspaceIds) {
             $exprs = foreach ($e in @(Get-Prop $model "expressions") | Where-Object { $_ }) {
                 [pscustomobject]@{ Name = $e.name; Query = @($e.expression) -join "`n" }
             }
-            [pscustomobject]@{ Tables = @($tables); Expressions = @($exprs) }
+            [pscustomobject]@{ Tables = @($tables); Expressions = @($exprs); Roles = @(ConvertFrom-RoleObjects (Get-Prop $model "roles")); RolesKnown = $true }
+        }
+
+        # --- Row-level security roles ----------------------------------------------
+        # One shape whichever way they were read:
+        #   Name, Permission, Filters ("Table: DAX"), Hidden (object-level security), Members
+
+        function ConvertFrom-TmdlRole([string] $Text) {
+            $lines = $Text -split "`r?`n"
+            $role = [pscustomobject]@{ Name = $null; Permission = $null; Filters = @(); Hidden = @(); Members = @() }
+            $section = $null; $table = $null; $column = $null
+            $i = 0
+            while ($i -lt $lines.Count) {
+                $line = $lines[$i]; $indent = Get-Indent $line; $t = $line.Trim()
+                if ($indent -eq 0 -and $t -match "^role\s+$tmdlName") { $role.Name = ConvertFrom-TmdlName $Matches[1] }
+                elseif ($indent -eq 1) {
+                    $section = ($t -split '\s+')[0]; $column = $null
+                    if ($t -match '^modelPermission:\s*(\w+)') { $role.Permission = $Matches[1] }
+                    elseif ($t -match "^tablePermission\s+$tmdlName\s*=\s*(.*)$") {
+                        $table = ConvertFrom-TmdlName $Matches[1]
+                        $v = Get-TmdlValue $lines $i 1 $Matches[2]
+                        $role.Filters += "${table}: $(($v.Text -split '\r?\n' | ForEach-Object { $_.Trim() }) -join ' ')"
+                        $i = $v.Next; continue
+                    }
+                    elseif ($t -match "^tablePermission\s+$tmdlName\s*$") { $table = ConvertFrom-TmdlName $Matches[1] }
+                    elseif ($t -match "^member\s+$tmdlName") { $role.Members += ConvertFrom-TmdlName $Matches[1] }
+                }
+                elseif ($indent -eq 2 -and $section -eq "tablePermission") {
+                    if ($t -match '^metadataPermission:\s*none') { $role.Hidden += $table }
+                    elseif ($t -match "^columnPermission\s+$tmdlName") { $column = ConvertFrom-TmdlName $Matches[1] }
+                }
+                elseif ($indent -eq 3 -and $section -eq "tablePermission" -and $column -and $t -match '^metadataPermission:\s*none') { $role.Hidden += "$table[$column]" }
+                elseif ($indent -eq 2 -and $section -eq "member" -and $t -match '^memberType:\s*group') {
+                    $role.Members[-1] = "$($role.Members[-1]) (group)"
+                }
+                $i++
+            }
+            $role
+        }
+
+        function ConvertFrom-RoleObjects($Roles) {
+            foreach ($r in @($Roles) | Where-Object { $_ }) {
+                $filters = @(); $hidden = @()
+                foreach ($tp in @(Get-Prop $r "tablePermissions") | Where-Object { $_ }) {
+                    $f = @(Get-Prop $tp "filterExpression") -join " "
+                    if ($f) { $filters += "$($tp.name): $(($f -split '\r?\n' | ForEach-Object { $_.Trim() }) -join ' ')" }
+                    if ("$(Get-Prop $tp 'metadataPermission')" -eq "none") { $hidden += $tp.name }
+                    foreach ($cp in @(Get-Prop $tp "columnPermissions") | Where-Object { $_ }) {
+                        if ("$(Get-Prop $cp 'metadataPermission')" -eq "none") { $hidden += "$($tp.name)[$($cp.name)]" }
+                    }
+                }
+                $members = @(Get-Prop $r "members") | Where-Object { $_ } | ForEach-Object {
+                    $n = $(if (Get-Prop $_ "memberName") { $_.memberName } else { Get-Prop $_ "memberId" })
+                    $(if ("$(Get-Prop $_ 'memberType')" -match 'group') { "$n (group)" } else { "$n" })
+                }
+                [pscustomobject]@{ Name = $r.name; Permission = Get-Prop $r "modelPermission"; Filters = $filters; Hidden = $hidden; Members = @($members) }
+            }
+        }
+
+        function Format-Roles($Roles) {
+            $list = @($Roles) | Where-Object { $_ }
+            if (-not $list.Count) { return "No row-level security roles" }
+            ($list | Sort-Object Name | ForEach-Object {
+                $parts = @()
+                $parts += $(if ($_.Filters.Count) { "filters: $($_.Filters -join '; ')" } else { "no filters" })
+                if ($_.Hidden.Count) { $parts += "hides (object-level security): $($_.Hidden -join ', ')" }
+                $parts += $(if ($_.Members.Count) { "members: $($_.Members -join ', ')" } else { "members: none assigned" })
+                "Role '$($_.Name)'$(if ($_.Permission) { " ($($_.Permission))" }): $($parts -join '; ')"
+            }) -join " | "
         }
 
         function Get-DefinitionModelParts([string] $ModelId) {
@@ -784,7 +1096,8 @@ foreach ($wsId in $workspaceIds) {
                 $tables = foreach ($k in $tableKeys) { ConvertFrom-TmdlTable $parts[$k] }
                 $exprs  = @()
                 if ($parts.ContainsKey("definition/expressions.tmdl")) { $exprs = @(ConvertFrom-TmdlExpressions $parts["definition/expressions.tmdl"]) }
-                return [pscustomobject]@{ Tables = @($tables); Expressions = $exprs }
+                $roles = @($parts.Keys | Where-Object { $_ -like "definition/roles/*.tmdl" } | ForEach-Object { ConvertFrom-TmdlRole $parts[$_] })
+                return [pscustomobject]@{ Tables = @($tables); Expressions = $exprs; Roles = $roles; RolesKnown = $true }
             }
             if ($parts.ContainsKey("model.bim")) { return ConvertFrom-ModelBim $parts["model.bim"] }
             throw "the definition had no tables (parts: $(@($parts.Keys) -join ', '))"
@@ -797,24 +1110,28 @@ foreach ($wsId in $workspaceIds) {
                 $m = Get-ScanModelParts $D
                 $info = Add-ModelRows $D.id $D.name $m.Tables $m.Expressions "admin scan"
                 if (Get-Prop $D "schemaMayNotBeUpToDate") { $info.Detail += " Schema may not be up to date." }
+                $security = $(if ($m.RolesKnown) { Format-Roles $m.Roles } else { "Unknown (the admin scan didn't return roles)" })
+                $info | Add-Member -NotePropertyName Security -NotePropertyValue $security
                 return $info
             }
             if ($SkipModelDefinition) {
-                return [pscustomobject]@{ Tables = $null; Queries = $null; Detail = "Unknown (the scan returned no tables and -SkipModelDefinition was used)" }
+                return [pscustomobject]@{ Tables = $null; Queries = $null; Detail = "Unknown (the scan returned no tables and -SkipModelDefinition was used)"; Security = "Unknown (-SkipModelDefinition was used)" }
             }
             try {
                 $m = Get-DefinitionModelParts $D.id
-                return Add-ModelRows $D.id $D.name $m.Tables $m.Expressions "model definition"
+                $info = Add-ModelRows $D.id $D.name $m.Tables $m.Expressions "model definition"
+                $info | Add-Member -NotePropertyName Security -NotePropertyValue (Format-Roles $m.Roles)
+                return $info
             } catch {
                 $why = Get-ShortError $_
                 if ($why -match '403') { $why = "$why; reading a model's definition needs Contributor or higher on the workspace" }
-                return [pscustomobject]@{ Tables = $null; Queries = $null; Detail = "Unknown (scan returned no tables; definition: $why)" }
+                return [pscustomobject]@{ Tables = $null; Queries = $null; Detail = "Unknown (scan returned no tables; definition: $why)"; Security = "Unknown (definition: $why)" }
             }
         }
 
         function Get-ModelSources($D) {
             $list = foreach ($u in @(Get-Prop $D "datasourceUsages") | Where-Object { $_ }) {
-                if ($sourceById.ContainsKey($u.datasourceInstanceId)) { Format-DataSource $sourceById[$u.datasourceInstanceId] }
+                if ($sourceById.ContainsKey($u.datasourceInstanceId)) { Format-DataSource $sourceById[$u.datasourceInstanceId] "$wsName / $($D.name)" }
             }
             $flows = @(Get-Prop $D "upstreamDataflows" | Where-Object { $_ }).Count
             if ($flows) { $list = @($list) + "Dataflows: $flows" }
@@ -880,7 +1197,14 @@ foreach ($wsId in $workspaceIds) {
         # 7. Build the rows
         # ---------------------------------------------------------------------------
 
-        function Add-Row($Id, $Name, $Type, $Folder, $Schedule, $Sources, $TableCount, $QueryCount, $QueryDetail, $Access) {
+        [hashtable] $itemObjById = @{}
+        foreach ($x in @($datasets) + @($reports) + @($dashboards) + @($wsApps)) { if ($x -and (Get-Prop $x "id")) { $itemObjById["$($x.id)"] = $x } }
+        function Add-Row($Id, $Name, $Type, $Folder, $Schedule, $Sources, $TableCount, $QueryCount, $QueryDetail, $Access, $Subscriptions, $Security) {
+            $meta = Get-ItemMeta $(if ($Id -and $itemObjById.ContainsKey("$Id")) { $itemObjById["$Id"] })
+            $inApp = $null
+            if ($Type -in "Interactive report", "Paginated report", "Dashboard") {
+                $inApp = $(if (-not $isFabricAdmin) { $noAdminAccess } elseif ($inAppById.ContainsKey($Id)) { $inAppById[$Id] } else { "No" })
+            }
             $rows.Add([pscustomobject]@{
                 WorkspaceName        = $wsName
                 WorkspaceId          = $wsId
@@ -888,9 +1212,19 @@ foreach ($wsId in $workspaceIds) {
                 ItemId               = $Id
                 ItemType             = $Type
                 Folder               = $Folder
+                InApp                = $inApp
+                Owner                = $meta.Owner
+                Created              = $meta.Created
+                ModifiedBy           = $meta.ModifiedBy
+                Modified             = $meta.Modified
+                Endorsement          = $meta.Endorsement
+                SensitivityLabel     = $meta.SensitivityLabel
+                Description          = $meta.Description
                 WorkspacePermissions = $permissionSummary
                 ItemAccess           = $Access
                 RefreshSchedule      = $Schedule
+                Subscriptions        = $Subscriptions
+                Security             = $Security
                 DataSources          = $Sources
                 TableCount           = $TableCount
                 QueryCount           = $QueryCount
@@ -903,19 +1237,19 @@ foreach ($wsId in $workspaceIds) {
             Write-Host "  Semantic model: $($d.name)"
             $q = Get-ModelQueryInfo $d
             Add-Row $d.id $d.name "Semantic model" (Get-ItemFolder $d.id) `
-                (Get-ModelSchedule "$wsId" $d.id) (Get-ModelSources $d) $q.Tables $q.Queries $q.Detail (Get-ItemAccess $d "dataset")
+                (Get-ModelSchedule "$wsId" $d.id) (Get-ModelSources $d) $q.Tables $q.Queries $q.Detail (Get-ItemAccess $d "dataset") $null $q.Security
         }
 
         foreach ($r in $reports) {
             if ((Get-Prop $r "reportType") -eq "PaginatedReport") {
                 Write-Host "  Paginated report: $($r.name)"
                 $src = Try-PbiGet "$ws/reports/$($r.id)/datasources"
-                $sources = $(if ($src) { Join-NonEmpty "; " (@($src.value) | ForEach-Object { Format-DataSource $_ }) } else { "Could not read: $script:LastError" })
+                $sources = $(if ($src) { Join-NonEmpty "; " (@($src.value) | ForEach-Object { Format-DataSource $_ "$wsName / $($r.name)" }) } else { "Could not read: $script:LastError" })
                 $rdl = Get-RdlInfo $r.id $r.name
                 $modelNames = foreach ($id in $rdl.Models) { "Semantic model: $(Get-ModelLabel $id '')" }
                 $sources = Join-NonEmpty "; " (@($sources) + @($modelNames))
                 Add-Row $r.id $r.name "Paginated report" (Get-ItemFolder $r.id) `
-                    "None (runs its queries when opened; check subscriptions in the service)" $sources $rdl.Count $rdl.Count $rdl.Detail (Get-ItemAccess $r "report")
+                    "None (runs its queries when opened; see Subscriptions)" $sources $rdl.Count $rdl.Count $rdl.Detail (Get-ItemAccess $r "report") (Get-Subscriptions $r "report")
             } else {
                 Write-Host "  Interactive report: $($r.name)"
                 $modelId   = Get-Prop $r "datasetId"
@@ -926,8 +1260,33 @@ foreach ($wsId in $workspaceIds) {
                     $schedule = "From semantic model ${label}: $(Get-ModelSchedule $modelWsId $modelId)"
                     $detail   = "None of its own: uses semantic model $label"
                 } else { $sources = "(no semantic model)"; $schedule = "n/a"; $detail = "n/a" }
-                Add-Row $r.id $r.name "Interactive report" (Get-ItemFolder $r.id) $schedule $sources $null $null $detail (Get-ItemAccess $r "report")
+                Add-Row $r.id $r.name "Interactive report" (Get-ItemFolder $r.id) $schedule $sources $null $null $detail (Get-ItemAccess $r "report") (Get-Subscriptions $r "report")
             }
+        }
+
+        foreach ($a in $wsApps) {
+            Write-Host "  App: $($a.name)"
+            $users = Try-PbiGet "admin/apps/$($a.id)/users"
+            $audience = $(if ($users) {
+                $text = Join-NonEmpty "; " (@($users.value) | Where-Object { $_ -and "$(Get-Prop $_ 'appUserAccessRight')" -ne "None" } | ForEach-Object {
+                    "$(Format-Principal $_): $(Format-AccessRight "$($_.appUserAccessRight)")"
+                } | Sort-Object)
+                $(if ($text) { $text } else { "(no users returned)" })
+            } else { "Could not read: $script:LastError" })
+            $contents = @($inAppById.Keys | ForEach-Object {
+                $id = $_
+                if ($inAppById[$id] -eq $a.name) {
+                    $item = (@($reports) + @($dashboards)) | Where-Object { $_.id -eq $id } | Select-Object -First 1
+                    if ($item) { $(if (Get-Prop $item "name") { $item.name } else { $item.displayName }) }
+                }
+            } | Sort-Object)
+            $lu = Get-Prop $a 'lastUpdate'   # PowerShell 7 reads it as a date, 5.1 as text
+            $updated = $(if ($lu -is [datetime]) { $lu.ToString("yyyy-MM-dd") } else { "$lu".Split('T')[0] })
+            $detail = Join-NonEmpty "; " @(
+                $(if (Get-Prop $a "description") { "Description: $($a.description)" }),
+                "Published by $(Get-Prop $a 'publishedBy')$(if ($updated) { ", last updated $updated" })",
+                "Contains $($contents.Count) items: $($contents -join ', ')")
+            Add-Row $a.id $a.name "App" $null $null $null $null $null $detail $audience $null
         }
 
         foreach ($db in $dashboards) {
@@ -937,7 +1296,7 @@ foreach ($wsId in $workspaceIds) {
                 "Semantic model $(Get-ModelLabel $id '')"
             }
             Add-Row $db.id $db.displayName "Dashboard" (Get-ItemFolder $db.id) `
-                "Tiles refresh with their semantic models" (Join-NonEmpty "; " $models) $null $null "$($tiles.Count) tiles; queries are in the semantic models" (Get-ItemAccess $db "dashboard")
+                "Tiles refresh with their semantic models" (Join-NonEmpty "; " $models) $null $null "$($tiles.Count) tiles; queries are in the semantic models" (Get-ItemAccess $db "dashboard") (Get-Subscriptions $db "dashboard")
         }
     } catch {
         # One workspace failing doesn't stop the others; it gets an error row in the output.
@@ -950,10 +1309,88 @@ foreach ($wsId in $workspaceIds) {
         $rows.Add([pscustomobject]@{
             WorkspaceName = $(if ($wsName) { $wsName } else { "(could not read)" }); WorkspaceId = $wsId
             ItemName = $null; ItemId = $null; ItemType = "Workspace error"; Folder = $null
-            WorkspacePermissions = $null; ItemAccess = $null; RefreshSchedule = $null; DataSources = $null
+            InApp = $null; WorkspacePermissions = $null; ItemAccess = $null; RefreshSchedule = $null; Subscriptions = $null; Security = $null; DataSources = $null
             TableCount = $null; QueryCount = $null; QueryDetail = "$msg$where"
         })
     }
+}
+
+# ---------------------------------------------------------------------------
+# Gateway rows: one per gateway used by the items read, with everything this
+# account can see about it, its connections and which items use them.
+# ---------------------------------------------------------------------------
+
+foreach ($gKey in @($script:gatewayUse.Keys | Sort-Object)) {
+    $g = $script:gatewayById[$gKey]
+    $name = $(if ($g -and (Get-Prop $g "displayName")) { $g.displayName } elseif ($g) { "Personal gateway" } else { "Gateway $gKey" })
+    Write-Host ""
+    Write-Host "Gateway: $name" -ForegroundColor Cyan
+
+    # The gateway itself
+    $settings = @()
+    if ($g) {
+        $settings += "Type: $(Get-Prop $g 'type')"
+        if (Get-Prop $g "version") { $settings += "version $($g.version)" }
+        if ($null -ne (Get-Prop $g "numberOfMemberGateways")) { $settings += "$($g.numberOfMemberGateways) cluster members" }
+        if (Get-Prop $g "loadBalancingSetting") { $settings += "load balancing: $($g.loadBalancingSetting)" }
+        if ($null -ne (Get-Prop $g "allowCloudConnectionRefresh")) { $settings += "cloud connection refresh allowed: $($g.allowCloudConnectionRefresh)" }
+        if ($null -ne (Get-Prop $g "allowCustomConnectors")) { $settings += "custom connectors allowed: $($g.allowCustomConnectors)" }
+        $vnet = Get-Prop $g "virtualNetworkAzureResource"
+        if ($vnet) { $settings += "virtual network: subscription $(Get-Prop $vnet 'subscriptionId'), resource group $(Get-Prop $vnet 'resourceGroupName'), network $(Get-Prop $vnet 'virtualNetworkName'), subnet $(Get-Prop $vnet 'subnetName')" }
+        if (Get-Prop $g "capacityId") { $settings += "capacity $($g.capacityId)" }
+        if ($null -ne (Get-Prop $g "inactivityMinutesBeforeSleep")) { $settings += "sleeps after $($g.inactivityMinutesBeforeSleep) minutes idle" }
+        if ("$(Get-Prop $g 'type')" -eq "OnPremises") {
+            try {
+                $members = @(Get-FabricPaged "$FabricApiUrl/gateways/$gKey/members")
+                $settings += "members: " + (($members | ForEach-Object {
+                    "$(Get-Prop $_ 'displayName') (version $(Get-Prop $_ 'version'), $(if ((Get-Prop $_ 'enabled') -eq $false) { 'disabled' } else { 'enabled' }))"
+                }) -join ", ")
+            } catch { $settings += "members: could not read ($(Get-ShortError $_))" }
+        }
+    } else {
+        $settings += "No access to this gateway's details: a gateway admin can add you as Connection creator or Admin to show its name, type, version and members"
+    }
+
+    # Who can manage or use the gateway
+    $admins = $(if ($g) {
+        try {
+            Join-NonEmpty "; " (@(Get-FabricPaged "$FabricApiUrl/gateways/$gKey/roleAssignments") | ForEach-Object {
+                "$(Format-FabricPrincipal $_.principal): $($_.role)" } | Sort-Object)
+        } catch { "Could not read gateway roles: $(Get-ShortError $_) (needs Connection creator or Admin on the gateway)" }
+    } else { "Not available: no access to this gateway" })
+
+    # Its connections used by the items read
+    $connections = foreach ($cKey in @($script:gatewayUse[$gKey].Keys | Sort-Object)) {
+        $c = $script:connectionById[$cKey]
+        $source = $script:gatewaySource[$cKey]
+        $usedBy = ($script:gatewayUse[$gKey][$cKey] | Sort-Object) -join ", "
+        if ($c) {
+            $cd = Get-Prop $c "connectionDetails"
+            $lastUsed = Get-Prop (Get-Prop $c "connectionRecency") "lastCredentialUsedDateTime"
+            $lastUsed = $(if ($lastUsed -is [datetime]) { $lastUsed.ToString("yyyy-MM-dd") } elseif ($lastUsed) { "$lastUsed".Split('T')[0] })
+            $users = try {
+                Join-NonEmpty ", " (@(Get-FabricPaged "$FabricApiUrl/connections/$cKey/roleAssignments") | ForEach-Object {
+                    "$(Format-FabricPrincipal $_.principal): $($_.role)" } | Sort-Object)
+            } catch { "could not read ($(Get-ShortError $_))" }
+            Join-NonEmpty "; " @(
+                "$(Get-ConnectionLabel $cKey)".Substring("connection: ".Length),
+                "$(Get-Prop $cd 'type'): $(Get-Prop $cd 'path')",
+                $(if ($lastUsed) { "credentials last used $lastUsed" }),
+                $(if ($users) { "users: $users" }),
+                "used by: $usedBy")
+        } else {
+            $label = $(if ($cKey -eq "(unknown)") { "Connection not identified by the API" } else { "Connection $cKey (no access to its details)" })
+            Join-NonEmpty "; " @($label, $source, "used by: $usedBy")
+        }
+    }
+
+    $rows.Add([pscustomobject]@{
+        WorkspaceName = "(all workspaces read)"; WorkspaceId = $null
+        ItemName = $name; ItemId = $gKey; ItemType = "Gateway"; Folder = $null; InApp = $null
+        WorkspacePermissions = $null; ItemAccess = $admins; RefreshSchedule = $null; Subscriptions = $null
+        DataSources = (@($connections) -join " | "); TableCount = $null; QueryCount = $null
+        QueryDetail = ($settings -join "; ")
+    })
 }
 
 # ---------------------------------------------------------------------------
@@ -989,9 +1426,19 @@ $output = foreach ($r in $rows) {
         ItemType             = $r.ItemType
         ItemId               = $r.ItemId
         Folder               = $r.Folder
+        InApp                = $r.InApp
+        Owner                = $r.Owner
+        Created              = $r.Created
+        ModifiedBy           = $r.ModifiedBy
+        Modified             = $r.Modified
+        Endorsement          = $r.Endorsement
+        SensitivityLabel     = $r.SensitivityLabel
+        Description          = Limit-Cell $r.Description
         WorkspacePermissions = Limit-Cell $r.WorkspacePermissions
         ItemAccess           = Limit-Cell $r.ItemAccess
         RefreshSchedule      = $r.RefreshSchedule
+        Subscriptions        = Limit-Cell $r.Subscriptions
+        Security             = Limit-Cell $r.Security
         DataSources          = Limit-Cell $r.DataSources
         TableCount           = $r.TableCount
         QueryCount           = $r.QueryCount
@@ -1003,18 +1450,92 @@ $output = foreach ($r in $rows) {
 $output = @($output | Sort-Object WorkspaceName, ItemType, Folder, ItemName)
 
 New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
-$outFile = Join-Path $OutputFolder ("PowerBI-inventory-{0}.csv" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$outFile = Join-Path $OutputFolder "PowerBI-inventory-$stamp.csv"
 # UTF-8 with a byte order mark, so Excel shows accented characters correctly
 $encoding = $(if ($PSVersionTable.PSVersion.Major -ge 6) { "utf8BOM" } else { "UTF8" })
 $output | Export-Csv -LiteralPath $outFile -NoTypeInformation -Encoding $encoding
 
 $output | Format-Table WorkspaceName, ItemName, ItemType, Folder, TableCount, QueryCount -AutoSize -Wrap | Out-Host
 
+# ---------------------------------------------------------------------------
+# 9. Tenant settings snapshot (Fabric admin only): every Admin portal tenant
+#    setting, plus the capacity, domain and workspace overrides, in its own file.
+# ---------------------------------------------------------------------------
+
+$settingsFile = $null
+$settingsNote = $null
+if ($SkipTenantSettings)                          { $settingsNote = "skipped (-SkipTenantSettings)" }
+elseif ($NoAdminScan -or $script:adminScanRefused) { $settingsNote = "not saved: needs a Fabric admin account" }
+else {
+    Write-Host ""
+    Write-Host "Reading tenant settings ..." -ForegroundColor Cyan
+
+    function ConvertTo-SettingRows($Settings, [string] $Scope, [string] $ScopeName) {
+        foreach ($t in @($Settings) | Where-Object { $_ }) {
+            $enabled  = (Get-Prop $t "enabled") -eq $true
+            $groups   = Join-NonEmpty ", " (@(Get-Prop $t "enabledSecurityGroups")  | Where-Object { $_ } | ForEach-Object { Get-Prop $_ "name" })
+            $excluded = Join-NonEmpty ", " (@(Get-Prop $t "excludedSecurityGroups") | Where-Object { $_ } | ForEach-Object { Get-Prop $_ "name" })
+            $delegated = Join-NonEmpty ", " @(
+                $(if ((Get-Prop $t "delegateToCapacity")  -eq $true) { "capacity admins" }),
+                $(if ((Get-Prop $t "delegateToDomain")    -eq $true) { "domain admins" }),
+                $(if ((Get-Prop $t "delegateToWorkspace") -eq $true) { "workspace admins" }))
+            [pscustomobject]@{
+                Scope        = $Scope
+                ScopeName    = $ScopeName
+                Group        = Get-Prop $t "tenantSettingGroup"
+                Title        = Get-Prop $t "title"
+                SettingName  = Get-Prop $t "settingName"
+                Enabled      = $(if ($enabled) { "Enabled" } else { "Disabled" })
+                AppliesTo    = $(if (-not $enabled) { $null } elseif ($groups) { "Security groups: $groups" } else { "Entire organization" })
+                ExceptGroups = $excluded
+                CanBeOverriddenBy = $delegated
+                DelegatedFrom = Get-Prop $t "delegatedFrom"
+                Properties   = Join-NonEmpty "; " (@(Get-Prop $t "properties") | Where-Object { $_ } | ForEach-Object { "$(Get-Prop $_ 'name'): $(Get-Prop $_ 'value')" })
+            }
+        }
+    }
+
+    $settingRows = New-Object System.Collections.Generic.List[object]
+    try {
+        foreach ($row in ConvertTo-SettingRows @(Get-FabricPaged "$FabricApiUrl/admin/tenantsettings") "Tenant" "") { $settingRows.Add($row) }
+
+        # Names for the override scopes, where they can be read
+        $capacityName = @{}
+        $caps = Try-PbiGet "admin/capacities"
+        if ($caps) { foreach ($c in @($caps.value)) { $capacityName["$($c.id)".ToLowerInvariant()] = "$(Get-Prop $c 'displayName') ($(Get-Prop $c 'sku'), $(Get-Prop $c 'region'))" } }
+        $domainName = @{}
+        try { foreach ($d in Get-FabricPaged "$FabricApiUrl/admin/domains" "domains") { $domainName["$($d.id)".ToLowerInvariant()] = Get-Prop $d "displayName" } } catch { }
+
+        foreach ($scope in @(
+            @{ Kind = "Capacity";  Url = "admin/capacities/delegatedTenantSettingOverrides"; Names = $capacityName },
+            @{ Kind = "Domain";    Url = "admin/domains/delegatedTenantSettingOverrides";    Names = $domainName },
+            @{ Kind = "Workspace"; Url = "admin/workspaces/delegatedTenantSettingOverrides"; Names = @{} })) {
+            try {
+                foreach ($o in Get-FabricPaged "$FabricApiUrl/$($scope.Url)") {
+                    $id = "$(Get-Prop $o 'id')"
+                    $label = $(if ($scope.Names.ContainsKey($id.ToLowerInvariant())) { "$($scope.Names[$id.ToLowerInvariant()]) [$id]" } else { $id })
+                    foreach ($row in ConvertTo-SettingRows (Get-Prop $o "tenantSettings") "$($scope.Kind) override" $label) { $settingRows.Add($row) }
+                }
+            } catch { Write-Warning "$($scope.Kind) overrides couldn't be read: $(Get-ShortError $_)" }
+        }
+
+        $settingsFile = Join-Path $OutputFolder "PowerBI-tenant-settings-$stamp.csv"
+        $settingRows | Sort-Object Scope, ScopeName, Group, Title | Export-Csv -LiteralPath $settingsFile -NoTypeInformation -Encoding $encoding
+        $overrides = @($settingRows | Where-Object { $_.Scope -ne "Tenant" }).Count
+        $settingsNote = "$($settingRows.Count - $overrides) settings, $overrides overrides"
+    } catch {
+        $settingsNote = "not saved: $(Get-ShortError $_)"
+        Write-Warning "Tenant settings couldn't be read: $(Get-ShortError $_)"
+    }
+}
+
 $okCount = $workspaceIds.Count - $failed.Count
 Write-Host "Workspaces read: $okCount of $($workspaceIds.Count)"
 foreach ($f in $failed) { Write-Host "  Not read: $($f.WorkspaceId): $($f.Error)" -ForegroundColor Red }
 Write-Host "Items: $(@($output | Where-Object { $_.ItemType -ne 'Workspace error' }).Count)"
 Write-Host "Saved: $outFile"
+if ($settingsFile) { Write-Host "       $settingsFile ($settingsNote)" } else { Write-Host "Tenant settings: $settingsNote" }
 Write-Host "This file contains connection details and queries: keep it within the team." -ForegroundColor Yellow
 
 if ($PassThru) { $output }
