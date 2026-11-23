@@ -29,8 +29,16 @@
                                        paginated report or dashboard
         Folder                         workspace folder path, e.g. Finance/Monthly
         WorkspacePermissions           who has which workspace role
+        ItemAccess                     semantic models: who has access other than
+                                       through a workspace role (shared directly,
+                                       or a Viewer given more than Read), and with
+                                       which permissions. Needs Admin or Member on
+                                       the workspace. Other item types have no API
+                                       for this and say so.
         RefreshSchedule                days, times, time zone
         DataSources                    servers, databases, URLs, gateways, dataflows
+                                       (blank for an interactive report that uses a
+                                       semantic model: see the model's own row)
         TableCount, QueryCount,        counts (see below) and their breakdown
         QueryDetail
         Tables                         each table, shared query or parameter (or
@@ -143,7 +151,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "2026-11-20.2"
+$ScriptVersion = "2026-11-23.3"
 
 # On any error, show where it happened, so the problem can be found from the output alone.
 trap {
@@ -211,6 +219,48 @@ function Get-MSources([string] $Expression) {
     if (-not $Expression) { return "" }
     Join-NonEmpty ", " ([regex]::Matches($Expression, $mSourcePattern) | ForEach-Object { $_.Groups[1].Value })
 }
+
+# ---------------------------------------------------------------------------
+# Item-level access (beyond workspace roles)
+# ---------------------------------------------------------------------------
+
+# "ReadReshareExplore" -> "Read, Reshare, Build" (Explore is what the service calls Build).
+function Format-AccessRight([string] $Right) {
+    $parts = [regex]::Matches($Right, '[A-Z][a-z]*') | ForEach-Object { if ($_.Value -eq "Explore") { "Build" } else { $_.Value } }
+    $parts -join ", "
+}
+
+function Get-PrincipalKeys($P) {
+    @((Get-Prop $P "graphId"), (Get-Prop $P "identifier"), (Get-Prop $P "emailAddress")) |
+        Where-Object { $_ } | ForEach-Object { "$_".ToLowerInvariant() }
+}
+
+function Format-Principal($P) {
+    $type  = Get-Prop $P "principalType"
+    if ($type -eq "None") { return "Entire organization" }
+    $name  = $(if (Get-Prop $P "displayName") { $P.displayName } else { Get-Prop $P "identifier" })
+    $email = Get-Prop $P "emailAddress"
+    $text  = $(if ($email -and $email -ne $name) { "$name ($email)" } else { "$name" })
+    switch ($type) { "Group" { "$text (group)" } "App" { "$text (app)" } default { $text } }
+}
+
+# Who has access to an item other than through a workspace role, from a list
+# of the item's users. $RightProperty is the access-right field of that list.
+# Workspace Viewers are listed too if the item gives them more than Read.
+function Format-ItemAccess($Users, [string] $RightProperty) {
+    $extra = foreach ($u in @($Users) | Where-Object { $_ }) {
+        $right = "$(Get-Prop $u $RightProperty)"
+        if (-not $right -or $right -eq "None") { continue }
+        $role = $null
+        foreach ($k in Get-PrincipalKeys $u) { if ($roleByKey.ContainsKey($k)) { $role = $roleByKey[$k]; break } }
+        if (-not $role) { "$(Format-Principal $u): $(Format-AccessRight $right)" }
+        elseif ($role -eq "Viewer" -and $right -ne "Read") { "$(Format-Principal $u): Viewer role; on this item: $(Format-AccessRight $right)" }
+    }
+    $text = Join-NonEmpty "; " @($extra | Sort-Object)
+    $(if ($text) { $text } else { "None beyond workspace roles" })
+}
+
+$itemAccessNotAvailable = "Not available for this item type (only semantic models can be read)"
 
 # ---------------------------------------------------------------------------
 # Workspaces to read
@@ -365,6 +415,7 @@ foreach ($wsId in $workspaceIds) {
                 Email         = Get-Prop $u "emailAddress"
                 PrincipalType = Get-Prop $u "principalType"
                 Role          = Get-Prop $u "groupUserAccessRight"
+                Keys          = @(Get-PrincipalKeys $u)
             }
         })
         $permissionSummary = Join-NonEmpty " | " (("Admin", "Member", "Contributor", "Viewer") | ForEach-Object {
@@ -375,6 +426,19 @@ foreach ($wsId in $workspaceIds) {
             if ($names.Count) { "${role}: $($names -join ', ')" }
         })
         if (-not $permissionSummary) { $permissionSummary = "(no users returned)" }
+
+        # Who has which workspace role, by any of their IDs, for the item-access check
+        [hashtable] $roleByKey = @{}
+        foreach ($p in $permissionRows) { foreach ($k in $p.Keys) { $roleByKey[$k] = $p.Role } }
+
+        # Item access for one item. Only semantic models have an API for this
+        # (Get Dataset Users In Group; needs Admin or Member on the workspace).
+        function Get-ItemAccess($Item, [string] $Kind) {
+            if ($Kind -ne "dataset") { return $itemAccessNotAvailable }
+            $u = Try-PbiGet "$ws/datasets/$($Item.id)/users"
+            if (-not $u) { return "Could not read: $script:LastError (needs Admin or Member on the workspace)" }
+            Format-ItemAccess $u.value "datasetUserAccessRight"
+        }
 
         # ---------------------------------------------------------------------------
         # 3. Folders (Fabric API)
@@ -760,7 +824,7 @@ foreach ($wsId in $workspaceIds) {
 
         function Get-ModelLabel([string] $ModelId, [string] $ModelWsId) {
             if ($datasetById.ContainsKey($ModelId)) { return "'$($datasetById[$ModelId].name)'" }
-            "model $ModelId in workspace $ModelWsId"
+            $(if ($ModelWsId) { "$ModelId (in workspace $ModelWsId)" } else { "$ModelId (in another workspace)" })
         }
 
         # ---------------------------------------------------------------------------
@@ -809,7 +873,7 @@ foreach ($wsId in $workspaceIds) {
         # 7. Build the rows
         # ---------------------------------------------------------------------------
 
-        function Add-Row($Id, $Name, $Type, $Folder, $Schedule, $Sources, $TableCount, $QueryCount, $QueryDetail) {
+        function Add-Row($Id, $Name, $Type, $Folder, $Schedule, $Sources, $TableCount, $QueryCount, $QueryDetail, $Access) {
             $rows.Add([pscustomobject]@{
                 WorkspaceName        = $wsName
                 WorkspaceId          = $wsId
@@ -818,6 +882,7 @@ foreach ($wsId in $workspaceIds) {
                 ItemType             = $Type
                 Folder               = $Folder
                 WorkspacePermissions = $permissionSummary
+                ItemAccess           = $Access
                 RefreshSchedule      = $Schedule
                 DataSources          = $Sources
                 TableCount           = $TableCount
@@ -831,7 +896,7 @@ foreach ($wsId in $workspaceIds) {
             Write-Host "  Semantic model: $($d.name)"
             $q = Get-ModelQueryInfo $d
             Add-Row $d.id $d.name "Semantic model" (Get-ItemFolder $d.id) `
-                (Get-ModelSchedule "$wsId" $d.id) (Get-ModelSources $d) $q.Tables $q.Queries $q.Detail
+                (Get-ModelSchedule "$wsId" $d.id) (Get-ModelSources $d) $q.Tables $q.Queries $q.Detail (Get-ItemAccess $d "dataset")
         }
 
         foreach ($r in $reports) {
@@ -843,19 +908,18 @@ foreach ($wsId in $workspaceIds) {
                 $modelNames = foreach ($id in $rdl.Models) { "Semantic model: $(Get-ModelLabel $id '')" }
                 $sources = Join-NonEmpty "; " (@($sources) + @($modelNames))
                 Add-Row $r.id $r.name "Paginated report" (Get-ItemFolder $r.id) `
-                    "None (runs its queries when opened; check subscriptions in the service)" $sources $rdl.Count $rdl.Count $rdl.Detail
+                    "None (runs its queries when opened; check subscriptions in the service)" $sources $rdl.Count $rdl.Count $rdl.Detail (Get-ItemAccess $r "report")
             } else {
                 Write-Host "  Interactive report: $($r.name)"
                 $modelId   = Get-Prop $r "datasetId"
                 $modelWsId = $(if (Get-Prop $r "datasetWorkspaceId") { $r.datasetWorkspaceId } else { "$wsId" })
                 if ($modelId) {
                     $label = Get-ModelLabel $modelId $modelWsId
-                    $sources  = "Semantic model $label"
-                    if ($datasetById.ContainsKey($modelId)) { $sources = "$sources -> $(Get-ModelSources $datasetById[$modelId])" }
+                    $sources  = $null   # left blank: the model is named in RefreshSchedule, and its sources are on the model's own row
                     $schedule = "From semantic model ${label}: $(Get-ModelSchedule $modelWsId $modelId)"
                     $detail   = "None of its own: uses semantic model $label"
                 } else { $sources = "(no semantic model)"; $schedule = "n/a"; $detail = "n/a" }
-                Add-Row $r.id $r.name "Interactive report" (Get-ItemFolder $r.id) $schedule $sources $null $null $detail
+                Add-Row $r.id $r.name "Interactive report" (Get-ItemFolder $r.id) $schedule $sources $null $null $detail (Get-ItemAccess $r "report")
             }
         }
 
@@ -866,7 +930,7 @@ foreach ($wsId in $workspaceIds) {
                 "Semantic model $(Get-ModelLabel $id '')"
             }
             Add-Row $db.id $db.displayName "Dashboard" (Get-ItemFolder $db.id) `
-                "Tiles refresh with their semantic models" (Join-NonEmpty "; " $models) $null $null "$($tiles.Count) tiles; queries are in the semantic models"
+                "Tiles refresh with their semantic models" (Join-NonEmpty "; " $models) $null $null "$($tiles.Count) tiles; queries are in the semantic models" (Get-ItemAccess $db "dashboard")
         }
     } catch {
         # One workspace failing doesn't stop the others; it gets an error row in the output.
@@ -879,7 +943,7 @@ foreach ($wsId in $workspaceIds) {
         $rows.Add([pscustomobject]@{
             WorkspaceName = $(if ($wsName) { $wsName } else { "(could not read)" }); WorkspaceId = $wsId
             ItemName = $null; ItemId = $null; ItemType = "Workspace error"; Folder = $null
-            WorkspacePermissions = $null; RefreshSchedule = $null; DataSources = $null
+            WorkspacePermissions = $null; ItemAccess = $null; RefreshSchedule = $null; DataSources = $null
             TableCount = $null; QueryCount = $null; QueryDetail = "$msg$where"
         })
     }
@@ -919,6 +983,7 @@ $output = foreach ($r in $rows) {
         ItemId               = $r.ItemId
         Folder               = $r.Folder
         WorkspacePermissions = Limit-Cell $r.WorkspacePermissions
+        ItemAccess           = Limit-Cell $r.ItemAccess
         RefreshSchedule      = $r.RefreshSchedule
         DataSources          = Limit-Cell $r.DataSources
         TableCount           = $r.TableCount
