@@ -29,12 +29,13 @@
                                        paginated report or dashboard
         Folder                         workspace folder path, e.g. Finance/Monthly
         WorkspacePermissions           who has which workspace role
-        ItemAccess                     semantic models: who has access other than
+        ItemAccess                     who has access to this item other than
                                        through a workspace role (shared directly,
                                        or a Viewer given more than Read), and with
-                                       which permissions. Needs Admin or Member on
-                                       the workspace. Other item types have no API
-                                       for this and say so.
+                                       which permissions. All item types with a
+                                       Fabric admin account; semantic models only
+                                       with a standard account (needs Admin or
+                                       Member on the workspace)
         RefreshSchedule                days, times, time zone
         DataSources                    servers, databases, URLs, gateways, dataflows
                                        (blank for an interactive report that uses a
@@ -151,7 +152,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$ScriptVersion = "2026-11-23.3"
+$ScriptVersion = "2026-11-23.2"
 
 # On any error, show where it happened, so the problem can be found from the output alone.
 trap {
@@ -245,7 +246,8 @@ function Format-Principal($P) {
 }
 
 # Who has access to an item other than through a workspace role, from a list
-# of the item's users. $RightProperty is the access-right field of that list.
+# of the item's users. $RightProperty is the access-right field of that list
+# (reportUserAccessRight, datasetUserAccessRight, dashboardUserAccessRight).
 # Workspace Viewers are listed too if the item gives them more than Read.
 function Format-ItemAccess($Users, [string] $RightProperty) {
     $extra = foreach ($u in @($Users) | Where-Object { $_ }) {
@@ -260,7 +262,7 @@ function Format-ItemAccess($Users, [string] $RightProperty) {
     $(if ($text) { $text } else { "None beyond workspace roles" })
 }
 
-$itemAccessNotAvailable = "Not available for this item type (only semantic models can be read)"
+$noAdminAccess = "Not available without a Fabric admin account"
 
 # ---------------------------------------------------------------------------
 # Workspaces to read
@@ -431,13 +433,18 @@ foreach ($wsId in $workspaceIds) {
         [hashtable] $roleByKey = @{}
         foreach ($p in $permissionRows) { foreach ($k in $p.Keys) { $roleByKey[$k] = $p.Role } }
 
-        # Item access for one item. Only semantic models have an API for this
-        # (Get Dataset Users In Group; needs Admin or Member on the workspace).
+        # Item access for one item. The admin scan includes each item's users;
+        # without it only semantic models can be read (needs Admin or Member).
         function Get-ItemAccess($Item, [string] $Kind) {
-            if ($Kind -ne "dataset") { return $itemAccessNotAvailable }
+            $right = @{ dataset = "datasetUserAccessRight"; report = "reportUserAccessRight"; dashboard = "dashboardUserAccessRight" }[$Kind]
+            if ($isFabricAdmin) {
+                if ($null -eq $Item.PSObject.Properties["users"]) { return "Not returned by the admin scan" }
+                return Format-ItemAccess (Get-Prop $Item "users") $right
+            }
+            if ($Kind -ne "dataset") { return $noAdminAccess }
             $u = Try-PbiGet "$ws/datasets/$($Item.id)/users"
             if (-not $u) { return "Could not read: $script:LastError (needs Admin or Member on the workspace)" }
-            Format-ItemAccess $u.value "datasetUserAccessRight"
+            Format-ItemAccess $u.value $right
         }
 
         # ---------------------------------------------------------------------------
